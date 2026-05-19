@@ -929,31 +929,37 @@ func TestRenderPromptTemplateFirstSkipsEmptyName(t *testing.T) {
 func TestProviderInfoForAgentResolvesAgentOverWorkspace(t *testing.T) {
 	ws := &config.Workspace{Provider: "codex"}
 	a := &config.Agent{Provider: "claude"}
-	gotKey, gotName := providerInfoForAgent(a, ws, nil)
+	gotKey, gotName, gotFile := providerInfoForAgent(a, ws, nil)
 	if gotKey != "claude" {
 		t.Errorf("key = %q, want %q (agent.Provider should win over workspace.Provider)", gotKey, "claude")
 	}
 	if gotName != "Claude Code" {
 		t.Errorf("displayName = %q, want %q", gotName, "Claude Code")
 	}
+	if gotFile != "CLAUDE.md" {
+		t.Errorf("instructionsFile = %q, want %q", gotFile, "CLAUDE.md")
+	}
 }
 
 func TestProviderInfoForAgentFallsBackToWorkspace(t *testing.T) {
 	ws := &config.Workspace{Provider: "codex"}
 	a := &config.Agent{}
-	gotKey, gotName := providerInfoForAgent(a, ws, nil)
+	gotKey, gotName, gotFile := providerInfoForAgent(a, ws, nil)
 	if gotKey != "codex" {
 		t.Errorf("key = %q, want %q", gotKey, "codex")
 	}
 	if gotName != "Codex CLI" {
 		t.Errorf("displayName = %q, want %q", gotName, "Codex CLI")
 	}
+	if gotFile != "AGENTS.md" {
+		t.Errorf("instructionsFile = %q, want %q", gotFile, "AGENTS.md")
+	}
 }
 
 func TestProviderInfoForAgentEmptyWhenNoneSet(t *testing.T) {
-	gotKey, gotName := providerInfoForAgent(&config.Agent{}, &config.Workspace{}, nil)
-	if gotKey != "" || gotName != "" {
-		t.Errorf("got (%q, %q), want both empty", gotKey, gotName)
+	gotKey, gotName, gotFile := providerInfoForAgent(&config.Agent{}, &config.Workspace{}, nil)
+	if gotKey != "" || gotName != "" || gotFile != "" {
+		t.Errorf("got (%q, %q, %q), want all empty", gotKey, gotName, gotFile)
 	}
 }
 
@@ -1011,7 +1017,7 @@ func TestEmbeddedMayorPromptRendersProviderSpecificSlashNote(t *testing.T) {
 func TestProviderDisplayNameFallsBackToKeyForUnknownProvider(t *testing.T) {
 	ws := &config.Workspace{Provider: "totally-unknown"}
 	a := &config.Agent{}
-	gotKey, gotName := providerInfoForAgent(a, ws, nil)
+	gotKey, gotName, _ := providerInfoForAgent(a, ws, nil)
 	if gotKey != "totally-unknown" {
 		t.Errorf("key = %q, want %q", gotKey, "totally-unknown")
 	}
@@ -1083,5 +1089,106 @@ func TestRenderPromptCityRootFragmentsAbsentNoEffect(t *testing.T) {
 	want := "plain body x"
 	if got != want {
 		t.Errorf("renderPrompt(no city-root fragments) = %q, want %q", got, want)
+	}
+}
+
+// TestInstructionsFileForBuiltinProviders verifies that instructionsFileFor
+// returns the correct file for known built-in providers.
+func TestInstructionsFileForBuiltinProviders(t *testing.T) {
+	cases := []struct {
+		provider string
+		want     string
+	}{
+		{"claude", "CLAUDE.md"},
+		{"codex", "AGENTS.md"},
+		{"gemini", "AGENTS.md"},
+		{"kiro", "AGENTS.md"},
+	}
+	for _, tc := range cases {
+		got := instructionsFileFor(tc.provider, nil)
+		if got != tc.want {
+			t.Errorf("instructionsFileFor(%q) = %q, want %q", tc.provider, got, tc.want)
+		}
+	}
+}
+
+// TestInstructionsFileForCityOverride verifies that a city-level provider
+// spec can override InstructionsFile.
+func TestInstructionsFileForCityOverride(t *testing.T) {
+	cityProviders := map[string]config.ProviderSpec{
+		"custom": {InstructionsFile: "CUSTOM.md"},
+	}
+	got := instructionsFileFor("custom", cityProviders)
+	if got != "CUSTOM.md" {
+		t.Errorf("instructionsFileFor(custom override) = %q, want %q", got, "CUSTOM.md")
+	}
+}
+
+// TestInstructionsFileForUnknownDefaultsToAgentsMd verifies that an unknown
+// provider defaults to "AGENTS.md".
+func TestInstructionsFileForUnknownDefaultsToAgentsMd(t *testing.T) {
+	got := instructionsFileFor("totally-unknown", nil)
+	if got != "AGENTS.md" {
+		t.Errorf("instructionsFileFor(unknown) = %q, want AGENTS.md", got)
+	}
+}
+
+// TestInstructionsFileForFamilyInheritance verifies that a provider that
+// inherits from claude (via BuiltinFamily) gets CLAUDE.md.
+func TestInstructionsFileForFamilyInheritance(t *testing.T) {
+	base := "builtin:claude"
+	cityProviders := map[string]config.ProviderSpec{
+		"my-claude-variant": {Base: &base},
+	}
+	got := instructionsFileFor("my-claude-variant", cityProviders)
+	if got != "CLAUDE.md" {
+		t.Errorf("instructionsFileFor(claude family) = %q, want CLAUDE.md", got)
+	}
+}
+
+// TestProviderInfoForAgentInstructionsFile verifies that providerInfoForAgent
+// populates the InstructionsFile return value correctly.
+func TestProviderInfoForAgentInstructionsFile(t *testing.T) {
+	cases := []struct {
+		name     string
+		provider string
+		want     string
+	}{
+		{"claude", "claude", "CLAUDE.md"},
+		{"codex", "codex", "AGENTS.md"},
+	}
+	for _, tc := range cases {
+		a := &config.Agent{Provider: tc.provider}
+		_, _, gotFile := providerInfoForAgent(a, nil, nil)
+		if gotFile != tc.want {
+			t.Errorf("%s: InstructionsFile = %q, want %q", tc.name, gotFile, tc.want)
+		}
+	}
+}
+
+// TestBuildTemplateDataIncludesInstructionsFile verifies that buildTemplateData
+// exposes InstructionsFile so templates can reference it.
+func TestBuildTemplateDataIncludesInstructionsFile(t *testing.T) {
+	ctx := PromptContext{InstructionsFile: "CLAUDE.md"}
+	data := buildTemplateData(ctx)
+	got, ok := data["InstructionsFile"]
+	if !ok {
+		t.Fatal("buildTemplateData: InstructionsFile key missing")
+	}
+	if got != "CLAUDE.md" {
+		t.Errorf("InstructionsFile = %q, want %q", got, "CLAUDE.md")
+	}
+}
+
+// TestInstructionsFileRenderedInTemplate verifies that {{ .InstructionsFile }}
+// resolves correctly in a rendered prompt template.
+func TestInstructionsFileRenderedInTemplate(t *testing.T) {
+	f := fsys.NewFake()
+	f.Files["/city/agents/x/prompt.template.md"] = []byte("read {{ .InstructionsFile }} for guidance")
+	got := renderPrompt(f, "/city", "", "agents/x/prompt.template.md",
+		PromptContext{InstructionsFile: "CLAUDE.md"}, "", io.Discard, nil, nil, nil)
+	want := "read CLAUDE.md for guidance"
+	if got != want {
+		t.Errorf("InstructionsFile template rendering = %q, want %q", got, want)
 	}
 }
