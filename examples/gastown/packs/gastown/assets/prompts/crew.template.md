@@ -331,10 +331,7 @@ you are!" - that is a FAILURE. YOU must push, not the user.
    ```
 
 2. **Run quality gates** (only if code changes were made):
-   ```bash
-   go test ./...             # or: make test
-   golangci-lint run ./...   # or: make lint
-   ```
+   {{ template "quality-gate-guidance" . }}
    File P0 beads if quality gates are broken.
 
 3. **Update beads** - close finished work, update status:

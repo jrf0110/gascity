@@ -47,7 +47,14 @@ type PromptContext struct {
 	// builtins, then the builtin family of a custom provider; falls back to
 	// ProviderKey when nothing else matches.
 	ProviderDisplayName string
-	Env                 map[string]string // from Agent.Env — custom vars
+	// InstructionsFile is the filename the provider reads for project
+	// instructions (e.g. "CLAUDE.md" for Claude, "AGENTS.md" for everything
+	// else). Templates can use this to reference the repo's own instruction
+	// file when pack-specific guidance is absent:
+	//
+	//   {{ .InstructionsFile }}  → "CLAUDE.md" or "AGENTS.md"
+	InstructionsFile string
+	Env              map[string]string // from Agent.Env — custom vars
 }
 
 // PromptRenderResult holds the rendered text plus the version and rendered
@@ -301,6 +308,7 @@ func buildTemplateData(ctx PromptContext) map[string]string {
 	m["SlingQuery"] = ctx.SlingQuery
 	m["ProviderKey"] = ctx.ProviderKey
 	m["ProviderDisplayName"] = ctx.ProviderDisplayName
+	m["InstructionsFile"] = ctx.InstructionsFile
 	return m
 }
 
@@ -395,23 +403,42 @@ func promptFuncMap(cityName, sessionTemplate string, store beads.Store, parentTm
 	}
 }
 
-// providerInfoForAgent returns the resolved provider key and human-readable
-// display name for an agent, without performing PATH lookups (which the full
-// config.ResolveProvider performs and which are inappropriate for prompt
-// rendering). Resolution chain: agent.Provider > workspace.Provider. Returns
-// empty strings when no provider name is configured.
-func providerInfoForAgent(a *config.Agent, ws *config.Workspace, cityProviders map[string]config.ProviderSpec) (key, displayName string) {
+// providerInfoForAgent returns the resolved provider key, human-readable
+// display name, and instructions file for an agent, without performing PATH
+// lookups (which the full config.ResolveProvider performs and which are
+// inappropriate for prompt rendering). Resolution chain: agent.Provider >
+// workspace.Provider. Returns empty strings when no provider name is
+// configured.
+func providerInfoForAgent(a *config.Agent, ws *config.Workspace, cityProviders map[string]config.ProviderSpec) (key, displayName, instructionsFile string) {
 	if a == nil {
-		return "", ""
+		return "", "", ""
 	}
 	name := a.Provider
 	if name == "" && ws != nil {
 		name = ws.Provider
 	}
 	if name == "" {
-		return "", ""
+		return "", "", ""
 	}
-	return name, providerDisplayNameFor(name, cityProviders)
+	return name, providerDisplayNameFor(name, cityProviders), instructionsFileFor(name, cityProviders)
+}
+
+// instructionsFileFor returns the provider's instruction file (e.g.
+// "CLAUDE.md", "AGENTS.md"). Resolution chain: city provider spec >
+// builtin spec for raw name > builtin spec for family > default "AGENTS.md".
+func instructionsFileFor(name string, cityProviders map[string]config.ProviderSpec) string {
+	if spec, ok := cityProviders[name]; ok && spec.InstructionsFile != "" {
+		return spec.InstructionsFile
+	}
+	if spec, ok := config.BuiltinProviders()[name]; ok && spec.InstructionsFile != "" {
+		return spec.InstructionsFile
+	}
+	if family := config.BuiltinFamily(name, cityProviders); family != "" && family != name {
+		if spec, ok := config.BuiltinProviders()[family]; ok && spec.InstructionsFile != "" {
+			return spec.InstructionsFile
+		}
+	}
+	return "AGENTS.md"
 }
 
 // providerDisplayNameFor returns the human-readable name for a provider.
