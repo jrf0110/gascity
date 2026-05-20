@@ -96,22 +96,86 @@ func renderGastownPromptForPack(t *testing.T, rel, agentName, templateName, rigN
 	}
 
 	ctx := map[string]string{
-		"AgentName":     agentName,
-		"BindingName":   bindingName,
-		"BindingPrefix": bindingPrefix,
-		"CityRoot":      "/city",
-		"DefaultBranch": "main",
-		"IssuePrefix":   "demo",
-		"RigName":       rigName,
-		"RigRoot":       "/repos/" + rigName,
-		"SlingQuery":    "bd ready --metadata-field gc.routed_to=<canonical> --unassigned",
-		"TemplateName":  templateName,
-		"WorkDir":       "/repos/" + rigName,
-		"WorkQuery":     "bd ready",
+		"AgentName":        agentName,
+		"BindingName":      bindingName,
+		"BindingPrefix":    bindingPrefix,
+		"CityRoot":         "/city",
+		"DefaultBranch":    "main",
+		"InstructionsFile": "",
+		"IssuePrefix":      "demo",
+		"RigName":          rigName,
+		"RigRoot":          "/repos/" + rigName,
+		"SlingQuery":       "bd ready --metadata-field gc.routed_to=<canonical> --unassigned",
+		"TemplateName":     templateName,
+		"WorkDir":          "/repos/" + rigName,
+		"WorkQuery":        "bd ready",
 	}
 	var buf bytes.Buffer
 	if err := tmpl.Execute(&buf, ctx); err != nil {
 		t.Fatalf("rendering %s: %v", rel, err)
+	}
+	return buf.String()
+}
+
+// renderCrewPromptWithInstructionsFile renders the crew template with the
+// given InstructionsFile value, loading all pack template fragments.
+func renderCrewPromptWithInstructionsFile(t *testing.T, instructionsFile string) string {
+	t.Helper()
+	dir := exampleDir()
+	rel := "packs/gastown/assets/prompts/crew.template.md"
+	tmpl := template.New(filepath.Base(rel)).
+		Funcs(template.FuncMap{
+			"basename": func(qualifiedName string) string {
+				_, name := config.ParseQualifiedName(qualifiedName)
+				return name
+			},
+			"cmd": func() string { return "gc" },
+			"session": func(agentName string) string {
+				return agentName
+			},
+		}).
+		Option("missingkey=zero")
+
+	fragmentPaths, err := filepath.Glob(filepath.Join(dir, "packs", "gastown", "template-fragments", "*.template.md"))
+	if err != nil {
+		t.Fatalf("glob template fragments: %v", err)
+	}
+	for _, fragmentPath := range fragmentPaths {
+		data, err := os.ReadFile(fragmentPath)
+		if err != nil {
+			t.Fatalf("reading %s: %v", fragmentPath, err)
+		}
+		if _, err := tmpl.Parse(string(data)); err != nil {
+			t.Fatalf("parsing %s: %v", fragmentPath, err)
+		}
+	}
+
+	data, err := os.ReadFile(filepath.Join(dir, rel))
+	if err != nil {
+		t.Fatalf("reading %s: %v", rel, err)
+	}
+	if _, err := tmpl.Parse(string(data)); err != nil {
+		t.Fatalf("parsing %s: %v", rel, err)
+	}
+
+	ctx := map[string]string{
+		"AgentName":        "gastown.crew",
+		"BindingName":      "gastown",
+		"BindingPrefix":    "gastown.",
+		"CityRoot":         "/city",
+		"DefaultBranch":    "main",
+		"InstructionsFile": instructionsFile,
+		"IssuePrefix":      "demo",
+		"RigName":          "myrig",
+		"RigRoot":          "/repos/myrig",
+		"SlingQuery":       "bd ready --unassigned",
+		"TemplateName":     "crew",
+		"WorkDir":          "/repos/myrig",
+		"WorkQuery":        "bd ready",
+	}
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, ctx); err != nil {
+		t.Fatalf("rendering crew template: %v", err)
 	}
 	return buf.String()
 }
@@ -2341,4 +2405,72 @@ func TestRefineryFormulaValidatesAgentIdentityAtStartup(t *testing.T) {
 			t.Errorf("refinery formula missing $GC_AGENT startup validation %q", want)
 		}
 	}
+}
+
+// TestCrewQualityGateFallbackToInstructionsFile verifies that the crew prompt
+// references the repo's instruction file when InstructionsFile is set.
+// Acceptance criteria 1 & 2: the fallback works for both CLAUDE.md and
+// AGENTS.md providers.
+func TestCrewQualityGateFallbackToInstructionsFile(t *testing.T) {
+	cases := []struct {
+		name             string
+		instructionsFile string
+		wantContains     string
+	}{
+		{
+			name:             "claude provider uses CLAUDE.md",
+			instructionsFile: "CLAUDE.md",
+			wantContains:     "CLAUDE.md",
+		},
+		{
+			name:             "codex provider uses AGENTS.md",
+			instructionsFile: "AGENTS.md",
+			wantContains:     "AGENTS.md",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := renderCrewPromptWithInstructionsFile(t, tc.instructionsFile)
+			if !strings.Contains(body, tc.wantContains) {
+				t.Errorf("crew prompt missing %q (InstructionsFile=%q)\n--- rendered (quality gate section) ---\n%s",
+					tc.wantContains, tc.instructionsFile, extractQualityGateSection(body))
+			}
+		})
+	}
+}
+
+// TestCrewQualityGateEmptyInstructionsFileShowsFallbackCommands verifies that
+// when InstructionsFile is empty (no provider configured), the crew prompt
+// falls back to the default go/lint commands instead of producing empty output.
+// Acceptance criterion 1: missing guidance falls back gracefully.
+func TestCrewQualityGateEmptyInstructionsFileShowsFallbackCommands(t *testing.T) {
+	body := renderCrewPromptWithInstructionsFile(t, "")
+	for _, want := range []string{
+		"go test ./...",
+		"make test",
+		"golangci-lint run ./...",
+		"make lint",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("crew prompt (empty InstructionsFile) missing fallback command %q\n--- quality gate section ---\n%s",
+				want, extractQualityGateSection(body))
+		}
+	}
+}
+
+// extractQualityGateSection returns the quality-gate portion of a rendered
+// crew prompt for diagnostic output in test failures.
+func extractQualityGateSection(body string) string {
+	const start = "Run quality gates"
+	const end = "File P0 beads"
+	si := strings.Index(body, start)
+	if si < 0 {
+		return "(quality-gate section not found)"
+	}
+	ei := strings.Index(body[si:], end)
+	if ei < 0 {
+		return body[si:]
+	}
+	return body[si : si+ei+len(end)]
 }
